@@ -1,6 +1,30 @@
 # 🕸️ SCM Graph RAG — Local Build
 
-A fully local **Hybrid Graph RAG** system for Supply Chain Management that combines **vector search** (Weaviate) with **knowledge graph traversal** (Neo4j) to answer complex SCM questions grounded in research literature.
+<p align="center">
+  <a href="https://github.com/abhirup93/scm-graph-rag/stargazers">
+    <img src="https://img.shields.io/github/stars/abhirup93/scm-graph-rag?style=social" alt="Stars"/>
+  </a>
+  <a href="https://github.com/abhirup93/scm-graph-rag/network/members">
+    <img src="https://img.shields.io/github/forks/abhirup93/scm-graph-rag?style=social" alt="Forks"/>
+  </a>
+  <a href="https://github.com/abhirup93/scm-graph-rag/watchers">
+    <img src="https://img.shields.io/github/watchers/abhirup93/scm-graph-rag?style=social" alt="Watchers"/>
+  </a>
+  <a href="https://github.com/abhirup93/scm-graph-rag/issues">
+    <img src="https://img.shields.io/github/issues/abhirup93/scm-graph-rag" alt="Issues"/>
+  </a>
+  <a href="https://github.com/abhirup93/scm-graph-rag/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/abhirup93/scm-graph-rag" alt="License"/>
+  </a>
+  <a href="https://github.com/abhirup93/scm-graph-rag/commits/main">
+    <img src="https://img.shields.io/github/last-commit/abhirup93/scm-graph-rag" alt="Last Commit"/>
+  </a>
+  <img src="https://img.shields.io/github/languages/top/abhirup93/scm-graph-rag" alt="Top Language"/>
+</p>
+
+<p align="center">
+A fully local <b>Hybrid Graph RAG</b> system for Supply Chain Management that combines <b>vector search</b> (Weaviate) with <b>knowledge graph traversal</b> (Neo4j) to answer complex SCM questions grounded in research literature.
+</p>
 
 ---
 
@@ -220,6 +244,14 @@ PG_DATABASE=postgres
 3. **Synthesis**: Groq synthesises a final answer citing both document chunks and graph triples, streamed token by token to the UI.
 
 4. **Memory**: Every conversation turn is checkpointed to PostgreSQL via `langgraph-checkpoint-postgres`, enabling true multi-turn memory across sessions.
+
+---
+
+## 👥 Contributors
+
+<a href="https://github.com/abhirup93/scm-graph-rag/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=abhirup93/scm-graph-rag" />
+</a>
 
 ---
 
