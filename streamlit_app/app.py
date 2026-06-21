@@ -1,9 +1,8 @@
-import sys, os, json, uuid
+import sys, os, json, uuid, re
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Load .env before anything else
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 PG_USER      = os.getenv("PG_USER")
@@ -18,26 +17,207 @@ DB_KWARGS = dict(
     dbname=PG_DATABASE, user=PG_USER, password=PG_PASSWORD,
 )
 
-# agent.py and tools.py are in project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from agent import create_agent, run_agent_stream   # streaming only now
+from agent import create_agent, run_agent_stream
 
 import psycopg2
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="SCM Graph RAG", page_icon="🕸️", layout="wide")
 st.markdown("""<style>
 .block-container{padding-top:1.5rem}
 </style>""", unsafe_allow_html=True)
 
-# ── Agent (singleton) ─────────────────────────────────────────────────────────
+
+# ── Source Ontology Graph (Claude-style dark interactive) ─────────────────────
+
+def _doc_label(filename):
+    import re
+    m = re.match(r"(\d{4}\.\d{5})(v\d+)\.pdf", filename)
+    if m:
+        return f"arXiv:{m.group(1)}"
+    name = filename.replace("_", " ").replace(".pdf", "")
+    return name[:22] + "…" if len(name) > 22 else name
+
+
+def _score_color(score):
+    if score >= 0.7: return "#bbf7d0", "#16a34a", "#14532d"
+    if score >= 0.4: return "#fef08a", "#ca8a04", "#713f12"
+    return "#bfdbfe", "#3b82f6", "#1e3a8a"
+
+
+def render_source_graph(query: str, sources: list):
+    import re
+    import plotly.graph_objects as go
+
+    if not sources:
+        return
+
+    # ── Group sources ─────────────────────────────────────────────────────────
+    arxiv_groups, standalone = {}, []
+    for src in sources:
+        m = re.match(r"(\d{4}\.\d{5})(v\d+)\.pdf", src["file"])
+        if m:
+            arxiv_groups.setdefault(m.group(1), []).append({**src, "_ver": m.group(2)})
+        else:
+            standalone.append(src)
+
+    # ── Node positions ────────────────────────────────────────────────────────
+    pos, meta = {}, {}
+    NW, NH = 0.55, 0.22   # node half-width, half-height
+
+    # Query at x=0
+    short_q = (query[:38] + "…") if len(query) > 38 else query
+    pos["query"] = (0.0, 0.0)
+    meta["query"] = dict(label=f"🔍 {short_q}", bg="#6366f1",
+                         border="#4338ca", font="#ffffff", bold=True)
+
+    # Level-1: arxiv parents + standalone
+    l1 = [f"p_{aid}" for aid in arxiv_groups] + [s["file"] for s in standalone]
+    n1 = len(l1)
+    for i, nid in enumerate(l1):
+        y = (i - (n1-1)/2) * 0.75
+        pos[nid] = (1.5, y)
+        if nid.startswith("p_"):
+            aid = nid[2:]
+            pos[nid] = (1.5, y)
+            meta[nid] = dict(label=f"📄 arXiv:{aid}", bg="#f8fafc",
+                             border="#94a3b8", font="#334155", bold=False)
+        else:
+            src = next(s for s in standalone if s["file"] == nid)
+            bg, bd, fc = _score_color(src["max_score"])
+            meta[nid] = dict(label=f"📘 {_doc_label(nid)}", bg=bg,
+                             border=bd, font=fc, bold=False)
+
+    # Level-2: versions under each arxiv paper
+    for aid, versions in arxiv_groups.items():
+        py = pos[f"p_{aid}"][1]
+        nv = len(versions)
+        for j, v in enumerate(versions):
+            y = py + (j - (nv-1)/2) * 0.55
+            pos[v["file"]] = (3.0, y)
+            bg, bd, fc = _score_color(v["max_score"])
+            meta[v["file"]] = dict(
+                label=f"{v['_ver'].upper()} · {v['chunk_count']}ch · {v['avg_score']}",
+                bg=bg, border=bd, font=fc, bold=False,
+            )
+
+    # ── Build edge list ───────────────────────────────────────────────────────
+    edges = []
+    for aid, versions in arxiv_groups.items():
+        total = sum(v["chunk_count"] for v in versions)
+        mx    = max(v["max_score"] for v in versions)
+        edges.append(("query", f"p_{aid}", f"{total} chunk{'s' if total>1 else ''}", max(1.5, mx*3), False))
+        for v in versions:
+            edges.append((f"p_{aid}", v["file"], "", 1.5, True))
+    for src in standalone:
+        edges.append(("query", src["file"],
+                      f"{src['chunk_count']} chunk{'s' if src['chunk_count']>1 else ''}",
+                      max(1.5, src["max_score"]*3), False))
+
+    # ── Draw ──────────────────────────────────────────────────────────────────
+    fig = go.Figure()
+
+    # Edges (lines)
+    for src_id, dst_id, elabel, lw, dashed in edges:
+        x0, y0 = pos[src_id]
+        x1, y1 = pos[dst_id]
+        # Offset start/end to edge of node box
+        x0e = x0 + NW
+        x1e = x1 - NW
+        dash = "dot" if dashed else "solid"
+        fig.add_trace(go.Scatter(
+            x=[x0e, x1e], y=[y0, y1], mode="lines",
+            line=dict(color="#cbd5e1", width=lw, dash=dash),
+            hoverinfo="none", showlegend=False,
+        ))
+        fig.add_annotation(
+            x=x1e, y=y1, ax=x0e, ay=y0,
+            xref="x", yref="y", axref="x", ayref="y",
+            showarrow=True, arrowhead=2, arrowsize=0.8,
+            arrowwidth=max(1, lw*0.5), arrowcolor="#94a3b8",
+        )
+        if elabel:
+            fig.add_annotation(
+                x=(x0e+x1e)/2, y=(y0+y1)/2 + 0.06,
+                text=elabel, showarrow=False,
+                font=dict(size=9, color="#6366f1"),
+                bgcolor="white", borderpad=2, opacity=0.9,
+            )
+
+    # Nodes (rect shapes + annotation labels)
+    for nid, (x, y) in pos.items():
+        m = meta[nid]
+        fig.add_shape(
+            type="rect",
+            x0=x-NW, y0=y-NH, x1=x+NW, y1=y+NH,
+            fillcolor=m["bg"],
+            line=dict(color=m["border"], width=2),
+            layer="above",
+        )
+        fig.add_annotation(
+            x=x, y=y,
+            text=f"<b>{m['label']}</b>" if m["bold"] else m["label"],
+            showarrow=False,
+            font=dict(size=10, color=m["font"],
+                      family="Inter, system-ui, sans-serif"),
+            xanchor="center", yanchor="middle",
+            bgcolor="rgba(0,0,0,0)",
+        )
+
+    # Invisible legend traces
+    for label, bg, bd in [
+        ("Query",               "#6366f1", "#4338ca"),
+        ("Paper",               "#f8fafc", "#94a3b8"),
+        ("High relevance ≥0.7", "#bbf7d0", "#16a34a"),
+        ("Medium ≥0.4",         "#fef08a", "#ca8a04"),
+        ("Lower",               "#bfdbfe", "#3b82f6"),
+    ]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=11, color=bg,
+                        line=dict(color=bd, width=2), symbol="square"),
+            name=label, showlegend=True,
+        ))
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    all_y = [y for _, y in pos.values()]
+    y_pad = max(0.5, NH * 3)
+    y_min = min(all_y) - y_pad
+    y_max = max(all_y) + y_pad
+
+    fig.update_layout(
+        height=max(320, int((y_max - y_min) * 160 + 120)),
+        paper_bgcolor="white", plot_bgcolor="white",
+        xaxis=dict(visible=False, range=[-0.7, 3.8]),
+        yaxis=dict(visible=False, range=[y_min, y_max]),
+        margin=dict(l=20, r=20, t=20, b=10),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=-0.15,
+            xanchor="center", x=0.5,
+            font=dict(size=10, color="#64748b"),
+            bgcolor="white", bordercolor="#e2e8f0", borderwidth=1,
+        ),
+        hoverlabel=dict(bgcolor="white", bordercolor="#e2e8f0",
+                        font=dict(size=11, family="Inter,system-ui,sans-serif")),
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+
+# ── Agent ─────────────────────────────────────────────────────────────────────
+
 @st.cache_resource(show_spinner="Loading SCM Graph RAG agent...")
 def get_agent():
     return create_agent()
 
 AGENT = get_agent()
 
+
 # ── PostgreSQL helpers ────────────────────────────────────────────────────────
+
 def _conn(): return psycopg2.connect(**DB_KWARGS)
 
 @st.cache_resource
@@ -127,7 +307,9 @@ def db_delete_all(user):
     except Exception as e:
         st.warning(f"Delete all: {e}")
 
+
 # ── Session state ─────────────────────────────────────────────────────────────
+
 def _init():
     for k, v in {
         "conversations": {}, "active_session_id": str(uuid.uuid4()),
@@ -142,7 +324,6 @@ if not st.session_state["db_loaded"]:
     st.session_state["conversations"].update(db_load(CURRENT_USER))
     st.session_state["db_loaded"] = True
 
-# ── Conversation helpers ───────────────────────────────────────────────────────
 def _first_msg(msgs):
     for m in msgs:
         if m.get("role") == "user":
@@ -190,7 +371,9 @@ if st.session_state["load_session_id"]:
     load_session(st.session_state["load_session_id"])
     st.session_state["load_session_id"] = None
 
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+
 with st.sidebar:
     st.markdown("## 🕸️ SCM Graph RAG")
     st.caption("Groq · Weaviate · Neo4j · LangGraph")
@@ -205,10 +388,8 @@ with st.sidebar:
     st.markdown("**Current Session**")
     st.code(st.session_state["active_session_id"][:18] + "...", language=None)
     st.caption(f"Turns: {st.session_state['turn_count']}")
-
     if st.button("➕ New Conversation", use_container_width=True, type="primary"):
         new_session(); st.rerun()
-
     st.divider()
     st.markdown("**📂 Conversation History**")
     history = {
@@ -226,7 +407,7 @@ with st.sidebar:
             db_delete_all(CURRENT_USER); st.rerun()
         st.markdown("---")
         for sid, conv in sorted(
-            history.items(), key=lambda x: x[1].get("created_at", ""), reverse=True
+            history.items(), key=lambda x: x[1].get("created_at",""), reverse=True
         ):
             c1, c2 = st.columns([5, 1])
             with c1:
@@ -241,7 +422,6 @@ with st.sidebar:
                     st.caption(f"{conv.get('turn_count',0)} turns")
                     if st.button("🗑️ Delete", key=f"del_{sid}", type="primary"):
                         delete_session(sid); st.rerun()
-
     st.divider()
     st.markdown("**💡 Try These**")
     for ex in [
@@ -256,7 +436,9 @@ with st.sidebar:
     st.divider()
     st.caption("© SCM Graph RAG · Local Build")
 
+
 # ── Main chat ─────────────────────────────────────────────────────────────────
+
 col_h, col_c = st.columns([5, 1])
 with col_h:
     st.title("🕸️ Supply Chain Graph RAG")
@@ -289,11 +471,14 @@ if not st.session_state["messages"]:
 
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
-        # Show thought process for assistant messages if saved
-        if msg["role"] == "assistant" and msg.get("thinking"):
-            with st.expander("💭 Thought process", expanded=False):
-                for step in msg["thinking"]:
-                    st.markdown(step)
+        if msg["role"] == "assistant":
+            if msg.get("thinking"):
+                with st.expander("💭 Thought process", expanded=False):
+                    for s in msg["thinking"]:
+                        st.markdown(s)
+            if msg.get("sources"):
+                with st.expander("📚 Source Ontology Graph", expanded=False):
+                    render_source_graph(msg.get("query",""), msg["sources"])
         st.markdown(msg["content"])
         if "ts" in msg:
             st.caption(msg["ts"])
@@ -316,49 +501,49 @@ if user_query:
 
         thinking_steps = []
         full_response  = ""
+        all_sources    = []
 
         for event in run_agent_stream(
             AGENT, user_query, st.session_state["active_session_id"]
         ):
             etype = event["type"]
 
-            # ── Tool call: agent decided to use a tool ────────────────────────
             if etype == "tool_call":
                 tool  = event["tool"]
                 query = event.get("query", "")
                 label = (
-                    f"🔍 **Searching documents**"
-                    f"{f': *{query[:60]}*' if query else '...'}"
+                    f"🔍 **Searching documents**{f': *{query[:60]}*' if query else '...'}"
                     if "weaviate" in tool else
-                    f"🕸️ **Querying knowledge graph**"
-                    f"{f': *{query[:60]}*' if query else '...'}"
+                    f"🕸️ **Querying knowledge graph**{f': *{query[:60]}*' if query else '...'}"
                 )
                 thinking_steps.append(label)
                 with thinking_placeholder.container():
                     with st.expander("💭 Thinking...", expanded=True):
-                        for s in thinking_steps:
-                            st.markdown(s)
+                        for s in thinking_steps: st.markdown(s)
 
-            # ── Tool result: tool finished ────────────────────────────────────
             elif etype == "tool_result":
-                tool  = event["tool"]
+                tool    = event["tool"]
+                sources = event.get("sources", [])
+                if sources:
+                    all_sources.extend(sources)
                 label = (
-                    "✅ Document search complete"
-                    if "weaviate" in tool else
-                    "✅ Graph traversal complete"
+                    f"✅ Documents retrieved — "
+                    f"{', '.join(s['file'] for s in sources)}"
+                    if "weaviate" in tool and sources
+                    else "✅ Document search complete"
+                    if "weaviate" in tool
+                    else "✅ Graph traversal complete"
                 )
                 thinking_steps.append(label)
                 with thinking_placeholder.container():
                     with st.expander("💭 Thinking...", expanded=True):
-                        for s in thinking_steps:
-                            st.markdown(s)
+                        for s in thinking_steps: st.markdown(s)
 
-            # ── Token: streaming the final response ───────────────────────────
             elif etype == "token":
                 full_response += event["content"]
                 response_placeholder.markdown(full_response + "▌")
 
-        # Finalise — remove cursor, collapse thinking expander
+        # ── Finalise ──────────────────────────────────────────────────────────
         response_placeholder.markdown(full_response)
         ts2 = datetime.now().strftime("%H:%M")
         st.caption(ts2)
@@ -366,14 +551,19 @@ if user_query:
         if thinking_steps:
             with thinking_placeholder.container():
                 with st.expander("💭 Thought process", expanded=False):
-                    for s in thinking_steps:
-                        st.markdown(s)
+                    for s in thinking_steps: st.markdown(s)
+
+        if all_sources:
+            with st.expander("📚 Source Ontology Graph", expanded=True):
+                render_source_graph(user_query, all_sources)
 
     st.session_state["messages"].append({
         "role"    : "assistant",
         "content" : full_response,
         "ts"      : ts2,
-        "thinking": thinking_steps,   # saved so it shows when scrolling back
+        "thinking": thinking_steps,
+        "sources" : all_sources,
+        "query"   : user_query,
     })
     st.session_state["turn_count"] += 1
     save_current()

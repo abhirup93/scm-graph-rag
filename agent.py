@@ -22,7 +22,7 @@ import psycopg
 from langchain_groq import ChatGroq
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.postgres import PostgresSaver
-from tools import weaviate_search, neo4j_graph_search
+from tools import weaviate_search, neo4j_graph_search, get_last_weaviate_sources
 
 SYSTEM_PROMPT = (
     "You are an expert Supply Chain Management (SCM) advisor with two tools:\n\n"
@@ -64,8 +64,8 @@ def run_agent_stream(agent, query: str, thread_id: str):
     Streaming mode — yields structured events for UI display.
 
     Event types:
-      {"type": "tool_call",   "tool": "weaviate_search",    "query": "..."}
-      {"type": "tool_result", "tool": "weaviate_search"}
+      {"type": "tool_call",   "tool": "...", "query": "..."}
+      {"type": "tool_result", "tool": "...", "sources": [...]}   ← includes source metadata
       {"type": "token",       "content": "..."}
     """
     config = {"configurable": {"thread_id": thread_id}}
@@ -78,7 +78,6 @@ def run_agent_stream(agent, query: str, thread_id: str):
         node = metadata.get("langgraph_node", "")
 
         if node == "agent":
-            # Agent is deciding to call a tool
             if hasattr(chunk, "tool_calls") and chunk.tool_calls:
                 for tc in chunk.tool_calls:
                     yield {
@@ -86,13 +85,15 @@ def run_agent_stream(agent, query: str, thread_id: str):
                         "tool" : tc["name"],
                         "query": tc.get("args", {}).get("query", ""),
                     }
-            # Agent is streaming its final response
             elif getattr(chunk, "content", ""):
                 yield {"type": "token", "content": chunk.content}
 
         elif node == "tools":
-            # Tool has finished executing
-            yield {
-                "type": "tool_result",
-                "tool": getattr(chunk, "name", "tool"),
-            }
+            tool_name = getattr(chunk, "name", "tool")
+            event = {"type": "tool_result", "tool": tool_name}
+
+            # Attach source metadata when weaviate_search completes
+            if tool_name == "weaviate_search":
+                event["sources"] = get_last_weaviate_sources()
+
+            yield event
