@@ -18,7 +18,7 @@ DB_KWARGS = dict(
 )
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from agent import create_agent, run_agent_stream
+from agent import create_agent, run_agent_stream, GROQ_MODELS, detect_complexity
 
 import psycopg2
 import streamlit as st
@@ -207,13 +207,12 @@ def render_source_graph(query: str, sources: list):
 
 
 
-# ── Agent ─────────────────────────────────────────────────────────────────────
+# ── Agent (cached per model) ──────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner="Loading SCM Graph RAG agent...")
-def get_agent():
-    return create_agent()
-
-AGENT = get_agent()
+@st.cache_resource(show_spinner="Loading agent...")
+def get_agent(model_id: str):
+    """One cached agent per model — avoids recreating on every rerun."""
+    return create_agent(model=model_id)
 
 
 # ── PostgreSQL helpers ────────────────────────────────────────────────────────
@@ -315,6 +314,8 @@ def _init():
         "conversations": {}, "active_session_id": str(uuid.uuid4()),
         "messages": [], "turn_count": 0, "pending_query": None,
         "load_session_id": None, "db_loaded": False,
+        "selected_model_display": "🤖 Auto (Smart Routing)",
+        "selected_model_id": "auto",
     }.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -388,6 +389,7 @@ with st.sidebar:
     st.markdown("**Current Session**")
     st.code(st.session_state["active_session_id"][:18] + "...", language=None)
     st.caption(f"Turns: {st.session_state['turn_count']}")
+
     if st.button("➕ New Conversation", use_container_width=True, type="primary"):
         new_session(); st.rerun()
     st.divider()
@@ -483,6 +485,61 @@ for msg in st.session_state["messages"]:
         if "ts" in msg:
             st.caption(msg["ts"])
 
+# ── Model selector fused with chat input ─────────────────────────────────────
+# CSS: fuse the selectbox bottom border with chat input top border
+st.markdown("""
+<style>
+/* Wrapper that holds model selector + chat input as one visual unit */
+div[data-testid="stVerticalBlock"] > div:has(> div[data-testid="stSelectbox"]) {
+    margin-bottom: -12px !important;
+    z-index: 10;
+    position: relative;
+}
+/* Style the selectbox to look like the top bar of the chat input */
+div[data-testid="stSelectbox"] > div > div {
+    background-color: #1e293b !important;
+    border: 1px solid #334155 !important;
+    border-bottom: none !important;
+    border-radius: 12px 12px 0 0 !important;
+    color: #94a3b8 !important;
+    font-size: 12px !important;
+    min-height: 32px !important;
+    padding: 2px 10px !important;
+}
+div[data-testid="stSelectbox"] svg { color: #64748b !important; }
+/* Chat input: remove top radius to connect with selectbox */
+div[data-testid="stChatInput"] > div {
+    border-radius: 0 0 12px 12px !important;
+    border-top: 1px solid #1e293b !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+_MODEL_OPTIONS = {
+    "🤖  Auto  —  Smart routing by complexity":    "auto",
+    "⚡  Llama 3.3 70B  —  Most capable":          "llama-3.3-70b-versatile",
+    "🚀  Llama 3.1 8B   —  Fast":                  "llama-3.1-8b-instant",
+    "🦙  Llama 4 Scout  —  Multimodal":  "meta-llama/llama-4-scout-17b-16e-instruct",
+    "⚖️  Llama 3.1 70B  —  Balanced":               "llama-3.1-70b-versatile",
+}
+
+_current_display = st.session_state.get(
+    "selected_model_display",
+    "🤖  Auto  —  Smart routing by complexity"
+)
+_selected_display = st.selectbox(
+    label="model_selector",
+    options=list(_MODEL_OPTIONS.keys()),
+    index=list(_MODEL_OPTIONS.keys()).index(_current_display)
+          if _current_display in _MODEL_OPTIONS else 0,
+    label_visibility="collapsed",
+    key="model_select_fused",
+)
+if _selected_display != st.session_state.get("selected_model_display"):
+    st.session_state["selected_model_display"] = _selected_display
+    st.session_state["selected_model_id"]      = _MODEL_OPTIONS[_selected_display]
+    st.rerun()
+
 user_query = (
     st.session_state.pop("pending_query", None)
     or st.chat_input("Ask about supply chain risks, suppliers, logistics...")
@@ -495,13 +552,33 @@ if user_query:
         st.markdown(user_query)
         st.caption(ts)
 
+    # ── Resolve model: auto-detect or use manual selection ────────────────────
+    selected_id = st.session_state.get("selected_model_id", "auto")
+    if selected_id == "auto":
+        resolved_model, complexity_label, complexity_reason = detect_complexity(user_query)
+        model_note = (
+            f"🧠 **Auto-selected:** `{resolved_model}` "
+            f"— **{complexity_label}** · {complexity_reason}"
+        )
+    else:
+        resolved_model    = selected_id
+        complexity_label  = "Manual"
+        model_note        = f"🤖 **Model:** `{resolved_model}` (manually selected)"
+
+    AGENT = get_agent(resolved_model)
+
     with st.chat_message("assistant"):
         thinking_placeholder = st.empty()
         response_placeholder = st.empty()
 
-        thinking_steps = []
+        # Model selection is always the first thought step
+        thinking_steps = [model_note]
         full_response  = ""
         all_sources    = []
+
+        with thinking_placeholder.container():
+            with st.expander("💭 Thinking...", expanded=True):
+                st.markdown(model_note)
 
         for event in run_agent_stream(
             AGENT, user_query, st.session_state["active_session_id"]
@@ -546,7 +623,7 @@ if user_query:
         # ── Finalise ──────────────────────────────────────────────────────────
         response_placeholder.markdown(full_response)
         ts2 = datetime.now().strftime("%H:%M")
-        st.caption(ts2)
+        st.caption(f"{ts2} · {resolved_model} · {complexity_label}")
 
         if thinking_steps:
             with thinking_placeholder.container():
@@ -564,6 +641,8 @@ if user_query:
         "thinking": thinking_steps,
         "sources" : all_sources,
         "query"   : user_query,
+        "model"   : resolved_model,
+        "complexity": complexity_label,
     })
     st.session_state["turn_count"] += 1
     save_current()
